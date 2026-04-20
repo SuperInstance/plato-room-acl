@@ -1,139 +1,178 @@
-"""Room access control — roles, permissions, inheritance, and policy engine."""
+"""Room ACL — role-based access control with inheritance, wildcards, and audit logging."""
 import time
-import hashlib
 from dataclasses import dataclass, field
 from typing import Optional
+from collections import defaultdict
 from enum import Enum
 
 class Permission(Enum):
     READ = "read"
     WRITE = "write"
+    DELETE = "delete"
     ADMIN = "admin"
     INVITE = "invite"
     KICK = "kick"
     BAN = "ban"
-    SPEAK = "speak"
-    MUTE = "mute"
+    MANAGE_TILES = "manage_tiles"
+    MANAGE_ROOM = "manage_room"
+    EXPORT = "export"
+    AUDIT = "audit"
+
+class Role(Enum):
+    OWNER = "owner"
+    ADMIN = "admin"
+    MODERATOR = "moderator"
+    MEMBER = "member"
+    VIEWER = "viewer"
+    GUEST = "guest"
+    BANNED = "banned"
+
+# Role hierarchy: higher role inherits all permissions from lower roles
+ROLE_HIERARCHY = {
+    Role.OWNER: 6, Role.ADMIN: 5, Role.MODERATOR: 4,
+    Role.MEMBER: 3, Role.VIEWER: 2, Role.GUEST: 1, Role.BANNED: 0,
+}
+
+ROLE_PERMISSIONS = {
+    Role.OWNER: list(Permission),
+    Role.ADMIN: [p for p in Permission if p != Permission.ADMIN],
+    Role.MODERATOR: [Permission.READ, Permission.WRITE, Permission.DELETE,
+                     Permission.MANAGE_TILES, Permission.KICK, Permission.INVITE],
+    Role.MEMBER: [Permission.READ, Permission.WRITE, Permission.MANAGE_TILES],
+    Role.VIEWER: [Permission.READ, Permission.EXPORT],
+    Role.GUEST: [Permission.READ],
+    Role.BANNED: [],
+}
 
 @dataclass
-class Role:
-    name: str
-    permissions: set[str] = field(default_factory=set)
-    inherits_from: str = ""
-    priority: int = 0  # higher = more powerful
-
-@dataclass
-class AclEntry:
-    agent: str
-    room: str
-    role: str = "guest"
+class ACLEntry:
+    agent_id: str
+    role: Role
+    room: str = ""
     granted_by: str = ""
     granted_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
-    revoked: bool = False
+    permissions: list[Permission] = field(default_factory=list)  # additional permissions beyond role
 
-class RoomAcl:
-    def __init__(self):
-        self._roles: dict[str, Role] = {}
-        self._entries: dict[str, AclEntry] = {}  # key = agent:room
-        self._bans: dict[str, dict[str, float]] = {}  # room -> {agent: expires_at}
-        self._defaults = {"*:read": True, "*:speak": True}
-        self._setup_default_roles()
+@dataclass
+class AuditEntry:
+    agent_id: str
+    action: str
+    target: str = ""
+    permission: str = ""
+    allowed: bool = False
+    timestamp: float = field(default_factory=time.time)
+    reason: str = ""
 
-    def _setup_default_roles(self):
-        self._roles["guest"] = Role("guest", {"read", "speak"}, priority=0)
-        self._roles["member"] = Role("member", {"read", "write", "speak"}, "guest", priority=1)
-        self._roles["moderator"] = Role("moderator", {"read", "write", "speak", "mute", "kick"}, "member", priority=2)
-        self._roles["admin"] = Role("admin", {"read", "write", "speak", "mute", "kick", "invite", "admin"}, "moderator", priority=3)
-        self._roles["owner"] = Role("owner", set(p.value for p in Permission), "admin", priority=4)
+class RoomACL:
+    def __init__(self, audit: bool = True):
+        self._entries: dict[str, dict[str, ACLEntry]] = defaultdict(dict)  # room → {agent → entry}
+        self._wildcards: dict[str, list[ACLEntry]] = defaultdict(list)  # room → [wildcard entries]
+        self._audit_log: list[AuditEntry] = []
+        self._audit_enabled = audit
 
-    def define_role(self, name: str, permissions: list[str], inherits: str = "", priority: int = 0) -> Role:
-        role = Role(name=name, permissions=set(permissions), inherits_from=inherits, priority=priority)
-        self._roles[name] = role
-        return role
-
-    def grant(self, agent: str, room: str, role: str = "member", granted_by: str = "",
-              expires_at: float = 0.0) -> AclEntry:
-        if role not in self._roles:
-            raise ValueError(f"Unknown role: {role}")
-        key = f"{agent}:{room}"
-        entry = AclEntry(agent=agent, room=room, role=role, granted_by=granted_by,
-                        expires_at=expires_at)
-        self._entries[key] = entry
+    def grant(self, room: str, agent_id: str, role: Role, granted_by: str = "",
+             expires_at: float = 0.0, permissions: list[Permission] = None) -> ACLEntry:
+        entry = ACLEntry(agent_id=agent_id, role=role, room=room, granted_by=granted_by,
+                        expires_at=expires_at, permissions=permissions or [])
+        self._entries[room][agent_id] = entry
+        self._audit("grant", agent_id, room, role.value, True)
         return entry
 
-    def revoke(self, agent: str, room: str) -> bool:
-        key = f"{agent}:{room}"
-        entry = self._entries.get(key)
+    def revoke(self, room: str, agent_id: str) -> bool:
+        entry = self._entries[room].pop(agent_id, None)
         if entry:
-            entry.revoked = True
+            self._audit("revoke", agent_id, room, entry.role.value, True)
             return True
         return False
 
-    def check(self, agent: str, room: str, permission: str) -> bool:
-        key = f"{agent}:{room}"
-        entry = self._entries.get(key)
-        if not entry or entry.revoked:
-            return self._check_default(permission)
-        if entry.expires_at > 0 and time.time() > entry.expires_at:
-            entry.revoked = True
-            return self._check_default(permission)
-        # Check ban
-        bans = self._bans.get(room, {})
-        if agent in bans:
-            if bans[agent] == 0 or time.time() < bans[agent]:
-                return False
-            del bans[agent]
-        # Resolve effective permissions via role inheritance
-        effective = self._resolve_permissions(entry.role)
-        return permission in effective
+    def grant_wildcard(self, room: str, pattern: str, role: Role, granted_by: str = ""):
+        entry = ACLEntry(agent_id=pattern, role=role, room=room, granted_by=granted_by)
+        self._wildcards[room].append(entry)
 
-    def _resolve_permissions(self, role_name: str) -> set[str]:
-        permissions = set()
-        visited = set()
-        current = role_name
-        while current and current not in visited:
-            visited.add(current)
-            role = self._roles.get(current)
-            if role:
-                permissions |= role.permissions
-                current = role.inherits_from
+    def check(self, room: str, agent_id: str, permission: Permission) -> bool:
+        # Check direct entry
+        entry = self._entries[room].get(agent_id)
+        allowed = False
+        reason = ""
+        if entry:
+            if entry.expires_at > 0 and entry.expires_at < time.time():
+                reason = "expired"
+            elif entry.role == Role.BANNED:
+                reason = "banned"
             else:
-                break
-        return permissions
+                # Check role permissions + additional permissions
+                role_perms = set(ROLE_PERMISSIONS.get(entry.role, []))
+                extra_perms = set(entry.permissions)
+                allowed = permission in role_perms or permission in extra_perms
+                if not allowed:
+                    # Check role hierarchy
+                    entry_level = ROLE_HIERARCHY.get(entry.role, 0)
+                    for role, level in ROLE_HIERARCHY.items():
+                        if level <= entry_level and permission in ROLE_PERMISSIONS.get(role, []):
+                            allowed = True
+                            break
+                reason = f"role={entry.role.value}" if allowed else f"role={entry.role.value} insufficient"
+        # Check wildcards
+        if not allowed:
+            for wc in self._wildcards.get(room, []):
+                if self._match_wildcard(wc.agent_id, agent_id):
+                    if permission in ROLE_PERMISSIONS.get(wc.role, []):
+                        allowed = True
+                        reason = f"wildcard={wc.agent_id}"
+                        break
+        # Default: check if any entry exists
+        if not entry and not any(self._match_wildcard(w.agent_id, agent_id) for wc in self._wildcards.get(room, [])):
+            allowed = False
+            reason = "no entry"
+        self._audit("check", agent_id, room, permission.value, allowed, reason)
+        return allowed
 
-    def _check_default(self, permission: str) -> bool:
-        return self._defaults.get(f"*:{permission}", False)
+    def get_role(self, room: str, agent_id: str) -> Optional[Role]:
+        entry = self._entries[room].get(agent_id)
+        return entry.role if entry else None
 
-    def ban(self, agent: str, room: str, duration: float = 0.0) -> bool:
-        if room not in self._bans:
-            self._bans[room] = {}
-        self._bans[room][agent] = time.time() + duration if duration > 0 else 0.0
-        return True
+    def members(self, room: str, role: Role = None) -> list[ACLEntry]:
+        entries = list(self._entries[room].values())
+        if role:
+            entries = [e for e in entries if e.role == role]
+        return entries
 
-    def unban(self, agent: str, room: str) -> bool:
-        bans = self._bans.get(room, {})
-        return bans.pop(agent, None) is not None
+    def purge_expired(self) -> int:
+        now = time.time()
+        purged = 0
+        for room in self._entries:
+            expired = [aid for aid, e in self._entries[room].items()
+                      if e.expires_at > 0 and e.expires_at < now]
+            for aid in expired:
+                self._entries[room].pop(aid, None)
+                purged += 1
+        return purged
 
-    def agents_in_room(self, room: str) -> list[dict]:
-        results = []
-        for key, entry in self._entries.items():
-            if entry.room == room and not entry.revoked:
-                if entry.expires_at > 0 and time.time() > entry.expires_at:
-                    continue
-                results.append({"agent": entry.agent, "role": entry.role,
-                              "granted_by": entry.granted_by, "granted_at": entry.granted_at})
-        return results
+    def audit_log(self, limit: int = 50) -> list[AuditEntry]:
+        return self._audit_log[-limit:]
 
-    def effective_role(self, agent: str, room: str) -> str:
-        entry = self._entries.get(f"{agent}:{room}")
-        if entry and not entry.revoked:
-            return entry.role
-        return "guest"
+    def _match_wildcard(self, pattern: str, agent_id: str) -> bool:
+        if pattern == "*":
+            return True
+        if pattern.endswith("*"):
+            return agent_id.startswith(pattern[:-1])
+        return pattern == agent_id
+
+    def _audit(self, action: str, agent_id: str, target: str, permission: str,
+               allowed: bool, reason: str = ""):
+        if not self._audit_enabled:
+            return
+        self._audit_log.append(AuditEntry(
+            agent_id=agent_id, action=action, target=target,
+            permission=permission, allowed=allowed, reason=reason))
+        if len(self._audit_log) > 10000:
+            self._audit_log = self._audit_log[-10000:]
 
     @property
     def stats(self) -> dict:
-        active = sum(1 for e in self._entries.values() if not e.revoked)
-        banned = sum(len(b) for b in self._bans.values())
-        return {"roles": len(self._roles), "active_grants": active,
-                "banned_agents": banned, "rooms_with_bans": len(self._bans)}
+        rooms = len(self._entries)
+        entries = sum(len(e) for e in self._entries.values())
+        wildcards = sum(len(w) for w in self._wildcards.values())
+        return {"rooms": rooms, "entries": entries, "wildcards": wildcards,
+                "audit_entries": len(self._audit_log)}
